@@ -29,24 +29,45 @@ final class LauncherPanel: NSPanel {
 final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
     private let apps: AppCatalog
     private let fsearch: FSearchClient
+    private let digup: DigUpClient
     private let panel: LauncherPanel
     private let effect = NSVisualEffectView()
     private let border = PassthroughView()
     private let field = NSTextField()
     private let modeIcon = NSImageView()
-    /// The "Files" pill at the start of the search line while searching files.
+    /// The pill at the start of the search line naming the mode ("Files", "Contents").
     private let chip = NSView()
     private let chipIcon = NSImageView()
-    private let chipLabel = NSTextField(labelWithString: "Files")
-    /// Searching files instead of apps: entered with a leading space (or '),
-    /// left with backspace on an empty line.
-    private var fileMode = false
+    private let chipLabel = NSTextField(labelWithString: "")
+    /// What the search line searches. A leading space (or ') enters `.files`,
+    /// a leading ` enters `.contents`; backspace on an empty line goes back to apps.
+    private enum Mode {
+        case apps
+        /// By name with fsearch, plus DigUp's content matches once typing pauses.
+        case files
+        /// By what's in them only, with DigUp.
+        case contents
+
+        var symbol: String {
+            switch self {
+            case .apps: return "magnifyingglass"
+            case .files: return "doc.text.magnifyingglass"
+            case .contents: return "sparkle.magnifyingglass"
+            }
+        }
+    }
+    private var mode = Mode.apps
     private let separator = NSBox()
     private let scroll = NSScrollView()
-    private let table = NSTableView()
+    private let table = ResultTable()
     private var items: [ResultItem] = []
     private var selected = 0
     private var generation = 0
+    /// File mode: fsearch's answer for the current query (nil until it
+    /// comes), DigUp's, and the pending DigUp search.
+    private var fileHits: Result<[FSHit], FSearchError>?
+    private var meaningHits: [MeaningHit] = []
+    private var meaningWork: DispatchWorkItem?
     private var monitor: Any?
     /// The panel's top edge on screen: it grows downward as results come in.
     private var top: CGFloat = 0
@@ -59,9 +80,10 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
     private let maxRows = 9
     private let radius: CGFloat = 14
 
-    init(apps: AppCatalog, fsearch: FSearchClient) {
+    init(apps: AppCatalog, fsearch: FSearchClient, digup: DigUpClient) {
         self.apps = apps
         self.fsearch = fsearch
+        self.digup = digup
         panel = LauncherPanel(
             contentRect: NSRect(x: 0, y: 0, width: 680, height: 72),
             styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
@@ -105,8 +127,6 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         chip.wantsLayer = true
         chip.layer?.cornerRadius = 8
         chip.isHidden = true
-        chipIcon.image = NSImage(systemSymbolName: "doc.text.magnifyingglass", accessibilityDescription: nil)?
-            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold))
         chipIcon.contentTintColor = .white
         chipLabel.font = .systemFont(ofSize: 16, weight: .semibold)
         chipLabel.textColor = .white
@@ -135,8 +155,7 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         table.refusesFirstResponder = true
         table.dataSource = self
         table.delegate = self
-        table.target = self
-        table.action = #selector(rowClicked)
+        table.onClick = { [weak self] row, mods in self?.run(row, modifiers: mods) }
         scroll.documentView = table
         scroll.drawsBackground = false
         scroll.contentView.drawsBackground = false
@@ -175,7 +194,7 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         top = vf.maxY - vf.height * 0.2
         panel.setFrameOrigin(NSPoint(x: vf.midX - width / 2, y: top - panel.frame.height))
         field.stringValue = ""
-        setFileMode(false)
+        setMode(.apps)
         update(items: [])
         panel.effectiveAppearance.performAsCurrentDrawingAppearance {
             self.border.layer?.borderColor = NSColor.separatorColor.cgColor
@@ -207,11 +226,12 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
 
         let fieldBottom = h - pad - fieldHeight
         let textHeight: CGFloat = 38
-        let chipSize = NSSize(width: 84, height: 30)
+        let labelWidth = ceil(chipLabel.intrinsicContentSize.width)
+        let chipSize = NSSize(width: 32 + labelWidth + 10, height: 30)
         chip.frame = NSRect(x: 18, y: fieldBottom + (fieldHeight - chipSize.height) / 2, width: chipSize.width, height: chipSize.height)
         chipIcon.frame = NSRect(x: 10, y: 6, width: 18, height: 18)
-        chipLabel.frame = NSRect(x: 32, y: 5, width: 46, height: 20)
-        let fieldX: CGFloat = fileMode ? chip.frame.maxX + 10 : 20
+        chipLabel.frame = NSRect(x: 32, y: 5, width: labelWidth, height: 20)
+        let fieldX: CGFloat = mode == .apps ? 20 : chip.frame.maxX + 10
         field.frame = NSRect(x: fieldX, y: fieldBottom + (fieldHeight - textHeight) / 2, width: width - fieldX - 58, height: textHeight)
         modeIcon.frame = NSRect(x: width - 46, y: fieldBottom + (fieldHeight - 26) / 2, width: 26, height: 26)
         separator.isHidden = n == 0
@@ -234,12 +254,17 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         if !items.isEmpty { table.scrollRowToVisible(selected) }
     }
 
-    /// Shows or hides the Files pill, and the placeholder and icon that go with the mode.
-    private func setFileMode(_ on: Bool) {
-        fileMode = on
+    /// Shows or hides the mode's pill, and the placeholder and icon that go with it.
+    private func setMode(_ new: Mode) {
+        if new != .apps, mode == .apps { digup.warmUp() }
+        mode = new
+        let on = new != .apps
         panel.effectiveAppearance.performAsCurrentDrawingAppearance {
             self.chip.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
         }
+        chipLabel.stringValue = new == .contents ? "Contents" : "Files"
+        chipIcon.image = NSImage(systemSymbolName: new.symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold))
         if on, chip.isHidden {
             chip.alphaValue = 0
             chip.isHidden = false
@@ -251,36 +276,31 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
             chip.isHidden = true
         }
         field.placeholderAttributedString = NSAttributedString(
-            string: on ? "Search files  ·  ext:pdf  in:~/Documents" : "Search apps  ·  space for files  ·  45+32",
+            string: [Mode.apps: "Apps  ·  space: files  ·  `: contents  ·  45+32",
+                     .files: "Search files  ·  ext:pdf  in:~/Documents",
+                     .contents: "Describe what's in the file"][new]!,
             attributes: [.foregroundColor: NSColor.tertiaryLabelColor, .font: font])
         layoutViews()
         updateModeIcon()
     }
 
     private func updateModeIcon() {
-        let symbol: String
-        if fileMode {
-            symbol = "doc.text.magnifyingglass"
-        } else if Calc.evaluate(field.stringValue) != nil {
-            symbol = "equal.circle"
-        } else {
-            symbol = "magnifyingglass"
-        }
-        modeIcon.contentTintColor = fileMode ? .controlAccentColor : .tertiaryLabelColor
+        let symbol = mode == .apps && Calc.evaluate(field.stringValue) != nil ? "equal.circle" : mode.symbol
+        modeIcon.contentTintColor = mode == .apps ? .tertiaryLabelColor : .controlAccentColor
         modeIcon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 20, weight: .regular))
     }
 
     // MARK: - Searching
 
-    /// A leading space (or ', as in Alfred) switches to file search; the
-    /// space itself becomes the Files pill.
+    /// A leading space (or ', as in Alfred) switches to file search, and a
+    /// leading ` to content search; the character becomes the mode's pill.
     func controlTextDidChange(_ obj: Notification) {
         let raw = field.stringValue
-        if !fileMode, raw.hasPrefix(" ") || raw.hasPrefix("'") {
+        if mode == .apps, let first = raw.first, let new: Mode = first == "`" ? .contents : first == " " || first == "'" ? .files : nil {
             field.stringValue = String(raw.dropFirst())
             moveCursorToEnd()
-            setFileMode(true)
+            setMode(new)
         }
         search()
     }
@@ -291,7 +311,10 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         let raw = field.stringValue
         updateModeIcon()
 
-        if fileMode {
+        if mode == .contents {
+            return searchContents(raw.trimmingCharacters(in: .whitespaces), gen)
+        }
+        if mode == .files {
             let q = raw.trimmingCharacters(in: .whitespaces)
             guard !q.isEmpty else {
                 return update(items: [ResultItem(
@@ -299,20 +322,28 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
                     subtitle: "Type a name. Filters work too: ext:pdf  in:~/Documents  type:image  mtime:<7d  grep:TODO",
                     action: .none, symbol: "doc.text.magnifyingglass")])
             }
+            fileHits = nil
+            meaningHits = []
             fsearch.search(q, limit: 50) { [weak self] r in
                 guard let self, gen == self.generation else { return }
-                switch r {
-                case .success(let hits) where hits.isEmpty:
-                    self.update(items: [ResultItem(
-                        title: "No files match “\(q)”", subtitle: "Try fewer letters, or a filter like ext:pdf",
-                        action: .none, symbol: "doc.questionmark")])
-                case .success(let hits):
-                    self.update(items: hits.map { self.fileItem($0) })
-                case .failure(let e):
-                    self.update(items: [ResultItem(
-                        title: e.description, subtitle: "fsearch", action: .none, symbol: "exclamationmark.triangle")])
+                self.fileHits = r
+                self.showFiles(q)
+            }
+            // By meaning too, once typing pauses: DigUp embeds the query
+            // (tens of ms) and compares it with every passage it indexed.
+            // fsearch's filters (ext:, in:, grep:…) mean a name search.
+            meaningWork?.cancel()
+            guard digup.isAvailable, q.count >= 3, !q.split(separator: " ").contains(where: { $0.contains(":") }) else { return }
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, gen == self.generation else { return }
+                self.digup.search(q, limit: 20) { [weak self] hits in
+                    guard let self, gen == self.generation else { return }
+                    self.meaningHits = hits
+                    self.showFiles(q)
                 }
             }
+            meaningWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
             return
         }
 
@@ -352,6 +383,83 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         }
     }
 
+    /// Content mode: only what DigUp finds by meaning and by exact words.
+    private func searchContents(_ q: String, _ gen: Int) {
+        meaningWork?.cancel()
+        guard digup.isAvailable else {
+            return update(items: [ResultItem(
+                title: "Searching by content needs DigUp",
+                subtitle: "brew install --cask arahim3/tap/digup, then pick the folders it should read",
+                action: .openURL(URL(string: "https://github.com/ARahim3/DigUp")!), symbol: Mode.contents.symbol)])
+        }
+        guard !q.isEmpty else {
+            return update(items: [ResultItem(
+                title: "Search by what's in a file",
+                subtitle: "In your own words: strange loop wire instructions  ·  the lease clause about pets",
+                action: .none, symbol: Mode.contents.symbol)])
+        }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, gen == self.generation else { return }
+            self.digup.search(q, limit: 30) { [weak self] hits in
+                guard let self, gen == self.generation else { return }
+                guard !hits.isEmpty else {
+                    return self.update(items: [ResultItem(
+                        title: "Nothing in DigUp's index matches “\(q)”",
+                        subtitle: "DigUp: \(self.digup.status). Add folders in DigUp, or ⌫ and space to search names",
+                        action: .none, symbol: "doc.questionmark")])
+                }
+                self.update(items: hits.map { self.meaningItem($0) })
+            }
+        }
+        meaningWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
+    }
+
+    /// Name matches and meaning matches in one list. When the names explain
+    /// the query (every word starts a word in some top file name) they lead;
+    /// otherwise the files whose contents match lead, since fsearch then
+    /// matched words in folder names or by typo.
+    private func showFiles(_ q: String) {
+        let names: [FSHit]
+        switch fileHits {
+        case nil:
+            guard !meaningHits.isEmpty else { return } // wait for fsearch
+            names = []
+        case .success(let hits)?:
+            names = hits
+        case .failure(let e)?:
+            guard !meaningHits.isEmpty else {
+                return update(items: [ResultItem(
+                    title: e.description, subtitle: "fsearch", action: .none, symbol: "exclamationmark.triangle")])
+            }
+            names = []
+        }
+        let confidence = Fuzzy.nameConfidence(q, paths: names.prefix(5).map(\.path))
+        let nameItems = names.map { fileItem($0) }
+        let meaningItems = meaningHits.map { meaningItem($0) }
+        let ordered = confidence >= 1 ? nameItems + meaningItems : meaningItems + nameItems
+        var seen = Set<String>()
+        let merged = ordered.filter { item in
+            guard case .openFile(let p) = item.action else { return true }
+            return seen.insert(p).inserted
+        }
+        guard !merged.isEmpty else {
+            return update(items: [ResultItem(
+                title: "No files match “\(q)”", subtitle: "Try fewer letters, or a filter like ext:pdf",
+                action: .none, symbol: "doc.questionmark")])
+        }
+        // The second answer for a query reorders the first: stay on the file
+        // that was selected, wherever it moved.
+        var current: String?
+        if items.indices.contains(selected), case .openFile(let p) = items[selected].action { current = p }
+        let list = Array(merged.prefix(50))
+        update(items: list)
+        if fileHits != nil, !meaningHits.isEmpty, let current,
+           let i = list.firstIndex(where: { if case .openFile(let p) = $0.action { return p == current }; return false }) {
+            select(i)
+        }
+    }
+
     private func withFallbacks(_ items: [ResultItem], _ q: String) -> [ResultItem] {
         guard items.isEmpty else { return items }
         var out = [ResultItem(
@@ -374,11 +482,31 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
 
     private func fileItem(_ hit: FSHit) -> ResultItem {
         let dir = Self.tilde((hit.path as NSString).deletingLastPathComponent)
+        var subtitle = hit.detail.map { "\(dir)  —  \($0)" } ?? dir
+        if showScores { subtitle = "name \(hit.score)  ·  " + subtitle }
         return ResultItem(
             title: (hit.path as NSString).lastPathComponent,
-            subtitle: hit.detail.map { "\(dir)  —  \($0)" } ?? dir,
+            subtitle: subtitle,
             action: .openFile(hit.path), iconPath: hit.path)
     }
+
+    /// A file DigUp found by what's in it: the passage that matched, marked ≈.
+    private func meaningItem(_ hit: MeaningHit) -> ResultItem {
+        var parts: [String] = []
+        if showScores {
+            parts.append(hit.cosine.map { String(format: "meaning %.2f", $0) } ?? "words #\(hit.keywordRank ?? 0)")
+        }
+        if hit.kind == "pdf", let page = hit.loc { parts.append("p. \(Int(page))") }
+        parts.append(hit.excerpt.map { "“\($0)”" } ?? Self.tilde((hit.path as NSString).deletingLastPathComponent))
+        return ResultItem(
+            title: (hit.path as NSString).lastPathComponent,
+            subtitle: "≈ " + parts.joined(separator: "  ·  "),
+            action: .openFile(hit.path), iconPath: hit.path)
+    }
+
+    /// `defaults write dev.fastlauncher.app ShowScores -bool true` shows each
+    /// file's match score: fsearch's name score, or DigUp's cosine similarity.
+    private var showScores: Bool { UserDefaults.standard.bool(forKey: "ShowScores") }
 
     static func appName(_ path: String) -> String {
         let name = FileManager.default.displayName(atPath: path)
@@ -398,9 +526,9 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         case #selector(NSResponder.insertNewline(_:)): run(selected, modifiers: NSApp.currentEvent?.modifierFlags ?? [])
         case #selector(NSResponder.cancelOperation(_:)): hide()
         case #selector(NSResponder.insertTab(_:)): autocomplete()
-        case #selector(NSResponder.deleteBackward(_:)) where fileMode && field.stringValue.isEmpty:
-            // Backspace on an empty line drops the Files pill: back to apps.
-            setFileMode(false)
+        case #selector(NSResponder.deleteBackward(_:)) where mode != .apps && field.stringValue.isEmpty:
+            // Backspace on an empty line drops the pill: back to apps.
+            setMode(.apps)
             search()
         default: return false
         }
@@ -463,11 +591,6 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         field.currentEditor()?.selectedRange = NSRange(location: (field.stringValue as NSString).length, length: 0)
     }
 
-    @objc private func rowClicked() {
-        let r = table.clickedRow
-        if r >= 0 { run(r, modifiers: NSApp.currentEvent?.modifierFlags ?? []) }
-    }
-
     private func run(_ i: Int, modifiers: NSEvent.ModifierFlags) {
         guard items.indices.contains(i) else { return }
         let item = items[i]
@@ -478,7 +601,7 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         case .searchFiles(let q):
             field.stringValue = q
             moveCursorToEnd()
-            setFileMode(true)
+            setMode(.files)
             search()
         case .copy(let s):
             hide()
@@ -537,6 +660,18 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
         image.resizingMode = .stretch
         return image
+    }
+}
+
+/// Takes clicks itself: a click opens the row, ⌘-click shows it in Finder,
+/// ⌥-click copies its path. (NSTableView would read ⌘-click as "toggle
+/// selection".)
+final class ResultTable: NSTableView {
+    var onClick: ((Int, NSEvent.ModifierFlags) -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        let r = row(at: convert(event.locationInWindow, from: nil))
+        if r >= 0 { onClick?(r, event.modifierFlags.intersection(.deviceIndependentFlagsMask)) }
     }
 }
 

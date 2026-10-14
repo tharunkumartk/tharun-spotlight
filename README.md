@@ -8,6 +8,7 @@ Press **⌘Space**, then:
 |---|---|
 | `saf` | apps: Safari. Fuzzy: `vsc` finds Visual Studio Code, `safri` finds Safari |
 | <code>&nbsp;report</code> (leading space, or `'`) | files across the whole disk, via fsearch. The space turns into a **Files** pill in the search bar; ⌫ on an empty line goes back to apps |
+| <code>\`strange loop wire instructions</code> (leading backtick) | files by what's in them, via [DigUp](#search-by-whats-in-a-file). The backtick turns into a **Contents** pill |
 | `45+32/658` | the answer as you type. ⏎ copies it |
 
 ## Install
@@ -51,11 +52,12 @@ changes the ad-hoc signature, so you'll need to grant it again after one.
 | ↑ ↓ (or ⌃P ⌃N) | move the selection |
 | ⏎ | open (for a math result: copy it) |
 | ⌘1 … ⌘9 | open that row |
-| ⌘⏎ | reveal in Finder |
-| ⌥⏎ | copy the path |
+| ⌘⏎ or ⌘-click | reveal in Finder |
+| ⌥⏎ or ⌥-click | copy the path |
 | ⇥ | complete the selected name into the search line |
 | space (first character) | switch to file search |
-| ⌫ on an empty line | leave file search |
+| \` (first character) | switch to content search |
+| ⌫ on an empty line | back to apps |
 | esc | close |
 
 ## File search
@@ -71,6 +73,33 @@ language works:
 ```
 
 Files you open from FastLauncher rank higher for a while (fsearch's frecency).
+
+### Search by what's in a file
+
+fsearch matches names. To also find files by what's in them, so that
+`strange loop wire instructions` finds a PDF called `Bank details.pdf`,
+install [DigUp](https://github.com/ARahim3/DigUp) and pick the folders it
+should read:
+
+```bash
+brew install --cask arahim3/tap/digup
+```
+
+DigUp reads PDFs, documents, screenshots and pictures with Google's
+EmbeddingGemma 2, on your Mac (it downloads the 865 MB model once and sends
+nothing about your files anywhere). FastLauncher asks it as you type, once
+you pause, and lists what it finds with a **≈** and the passage that
+matched. Start with a backtick (\`) to search contents only. When every word you typed starts a word in a file name, name
+matches come first; otherwise the content matches do, since fsearch then
+only matched folder names or a typo. Queries with a filter (`ext:pdf`,
+`in:…`) search names only.
+
+To see each file's match score (fsearch's name score, or DigUp's cosine
+similarity):
+
+```bash
+defaults write dev.fastlauncher.app ShowScores -bool true
+```
 
 ## Apps
 
@@ -98,5 +127,6 @@ Sources/Calc.swift          the expression parser
 Sources/Fuzzy.swift         app name matching
 Sources/Apps.swift          app catalog and launch history
 Sources/FSearchClient.swift fsearch daemon client (JSON lines over its unix socket)
+Sources/DigUpClient.swift   DigUp search-service client (JSON lines over a pipe)
 Tests/                      Linux tests for the non-UI parts, plus a fake daemon
 ```

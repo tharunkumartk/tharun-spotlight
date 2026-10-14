@@ -14,6 +14,9 @@ struct FSHit {
     let kind: String
     /// For a content search (`grep:`), the first matching line.
     let detail: String?
+    /// fsearch's match score: points per matched letter and word boundary,
+    /// summed over the query's words, so longer queries score higher.
+    var score: Int = 0
 }
 
 struct FSearchError: Error, CustomStringConvertible {
@@ -93,12 +96,12 @@ final class FSearchClient {
                 guard let path = f["path"] as? String else { return nil }
                 let m = (f["matches"] as? [[String: Any]])?.first
                 let detail = m.map { "\($0["line"] ?? ""): " + (($0["text"] as? String) ?? "").trimmingCharacters(in: .whitespaces) }
-                return FSHit(path: path, kind: "file", detail: detail)
+                return FSHit(path: path, kind: "file", detail: detail, score: f["score"] as? Int ?? 0)
             }
         }
         let hits = v["hits"] as? [[String: Any]] ?? []
         return hits.compactMap { h in
-            (h["path"] as? String).map { FSHit(path: $0, kind: h["kind"] as? String ?? "file", detail: nil) }
+            (h["path"] as? String).map { FSHit(path: $0, kind: h["kind"] as? String ?? "file", detail: nil, score: h["score"] as? Int ?? 0) }
         }
     }
 

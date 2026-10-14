@@ -64,6 +64,7 @@ enum SpotlightShortcut {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let apps = AppCatalog()
     private let fsearch = FSearchClient()
+    private let digup = DigUpClient()
     private var launcher: LauncherController!
     private var hotKey: HotKey?
     private var hotKeySpec = "cmd+space"
@@ -72,7 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         apps.refresh(force: true)
         fsearch.warmUp()
-        launcher = LauncherController(apps: apps, fsearch: fsearch)
+        launcher = LauncherController(apps: apps, fsearch: fsearch, digup: digup)
         setUpStatusItem()
 
         hotKeySpec = UserDefaults.standard.string(forKey: "Hotkey") ?? "cmd+space"
@@ -115,6 +116,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let status = NSMenuItem(title: fsearch.problem.map { "fsearch: \($0)" } ?? "fsearch: connected", action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
+        let meaning = NSMenuItem(title: "DigUp (search by content): \(digup.status)", action: nil, keyEquivalent: "")
+        meaning.isEnabled = false
+        menu.addItem(meaning)
         add(menu, "Rescan Applications", #selector(rescan))
         if hotKeySpec == "cmd+space", SpotlightShortcut.shortcutEnabled {
             add(menu, "Free ⌘Space from Spotlight…", #selector(showSpotlightHelp))
@@ -182,6 +186,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+// A helper that dies (DigUp's search service) must not take us with it
+// when we next write to its pipe.
+signal(SIGPIPE, SIG_IGN)
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

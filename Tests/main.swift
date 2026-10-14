@@ -58,6 +58,17 @@ for q in ["s", "sl", "sett", "vsc", "note", "scr"] {
 }
 check(AppCatalog.isUserFacing("/Users/me/Downloads/Foo.app"), "user app ok")
 check(!AppCatalog.isUserFacing("/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app"), "nested app skipped")
+
+// MARK: Name confidence
+
+func conf(_ q: String, _ paths: [String]) -> Double { Fuzzy.nameConfidence(q, paths: paths) }
+check(conf("strange loop wire instructions", ["/u/strange-loop/mcps/INSTRUCTIONS.md"]) == 0.25, "folder-only words don't count")
+check(conf("wire instructions", ["/u/Wire Transfer Instructions - GIFTS.pdf"]) == 1, "all words in the name")
+check(conf("wire instr", ["/u/a.txt", "/u/Wire Transfer Instructions.pdf"]) == 1, "word prefixes, best of several")
+check(conf("struct", ["/u/Instructions.pdf"]) == 0, "mid-word substring doesn't count")
+check(conf("invoice ext:pdf", ["/u/invoice-2024.pdf"]) == 1, "filters ignored")
+check(conf("report", []) == 0, "no hits")
+check(conf("ext:pdf", ["/u/x.pdf"]) == 1, "only filters")
 check(!AppCatalog.isUserFacing("/Users/me/Library/Caches/x.app"), "Library skipped")
 
 // MARK: FSearchClient against a fake daemon

@@ -74,6 +74,27 @@ enum Fuzzy {
         return nil
     }
 
+    /// How much of a file search the file names themselves explain, 0…1: the
+    /// share of the query's words found (starting a word, or as initials)
+    /// in the best of `paths`' names. fsearch also matches words
+    /// against folders, so "strange loop wire instructions" finds
+    /// strange-loop/…/INSTRUCTIONS.md; that scores 0.25 here. Filters such
+    /// as ext:pdf and -word don't count.
+    static func nameConfidence(_ query: String, paths: [String]) -> Double {
+        let words = query.split(separator: " ").map(String.init)
+            .filter { !$0.contains(":") && !$0.hasPrefix("-") }
+            .map { fold($0) }
+            .filter { $0.count >= 2 }
+        guard !words.isEmpty else { return 1 }
+        var best = 0
+        for p in paths {
+            let name = Name(((p as NSString).lastPathComponent as NSString).deletingPathExtension)
+            best = max(best, words.filter { (score($0, name) ?? 0) >= 700 }.count)
+            if best == words.count { break }
+        }
+        return Double(best) / Double(words.count)
+    }
+
     /// Each query letter continues the current word or starts a later one:
     /// "vsc" and "vscode" both name Visual Studio Code.
     static func acronym(_ q: ArraySlice<Character>, _ words: ArraySlice<ArraySlice<Character>>) -> Bool {
