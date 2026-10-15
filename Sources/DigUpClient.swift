@@ -6,6 +6,9 @@ struct MeaningHit {
     let kind: String
     /// Cosine similarity of the best passage, when it matched by meaning.
     let cosine: Double?
+    /// How far that passage stands out from everything indexed, in standard
+    /// deviations (DigUp's own gate for a meaning match).
+    let z: Double?
     /// 1-based rank among exact-word matches, when it matched by words.
     let keywordRank: Int?
     /// PDF page, or seconds into audio or video.
@@ -83,6 +86,14 @@ final class DigUpClient {
         }
     }
 
+    /// A meaning match as a percent, from how far it stands out (`z`), not
+    /// its cosine: EmbeddingGemma's cosines bunch together (on one index, the
+    /// top hit for gibberish had 0.71 and for "lease agreement" 0.77), while
+    /// z went from 3.4 for gibberish to 5–6 for real matches. So 3 → 0%, 6 → 100%.
+    static func percent(z: Double) -> Int {
+        Int((min(max((z - 3) / 3, 0), 1) * 100).rounded())
+    }
+
     static func hits(_ v: [String: Any]) -> [MeaningHit] {
         let all = v["hits"] as? [[String: Any]] ?? []
         let strong = v["strong"] as? Int ?? all.count
@@ -91,6 +102,7 @@ final class DigUpClient {
             return MeaningHit(
                 path: path, kind: h["kind"] as? String ?? "file",
                 cosine: (h["cosine"] as? NSNumber)?.doubleValue,
+                z: (h["z"] as? NSNumber)?.doubleValue,
                 keywordRank: h["keyword_rank"] as? Int,
                 loc: (h["loc"] as? NSNumber)?.doubleValue,
                 excerpt: (h["excerpt"] as? String).map {

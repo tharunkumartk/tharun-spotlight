@@ -32,6 +32,11 @@ final class FSearchClient {
     let binary: String?
     /// The last connection problem, nil while connected. Read on the main thread.
     private(set) var problem: String?
+    /// Whether the daemon can read Desktop, Documents, Downloads and iCloud
+    /// Drive; nil until it says. It checks once, when it starts, and the
+    /// grant is to the fsearch binary when it runs as its own login agent.
+    /// Read on the main thread.
+    private(set) var fullDiskAccess: Bool?
 
     private var fd: Int32 = -1
     private var pending = Data()
@@ -79,9 +84,42 @@ final class FSearchClient {
         queue.async { _ = self.request(["op": "open", "path": path]) }
     }
 
-    /// Connects (starting the daemon if needed) ahead of the first search.
+    /// Connects (starting the daemon if needed) ahead of the first search,
+    /// and learns whether it has Full Disk Access.
     func warmUp() {
-        queue.async { _ = self.request(["op": "ping"]) }
+        queue.async {
+            guard case .success(let v) = self.request(["op": "status"]), let fda = v["full_disk_access"] as? Bool else { return }
+            DispatchQueue.main.async { self.fullDiskAccess = fda }
+        }
+    }
+
+    /// Restarts the daemon, so it picks up a Full Disk Access grant. With
+    /// fsearch's login agent (`fsearch install --login`) launchd restarts it;
+    /// otherwise the next search starts one.
+    func restartDaemon() {
+        queue.async {
+            let agent = Process()
+            agent.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            agent.arguments = ["kickstart", "-k", "gui/\(getuid())/mt.nd.fsearch"]
+            agent.standardError = FileHandle.nullDevice
+            var kicked = false
+            if (try? agent.run()) != nil {
+                agent.waitUntilExit()
+                kicked = agent.terminationStatus == 0
+            }
+            if !kicked {
+                // The daemon writes its pid next to the socket.
+                let lock = (self.socketPath as NSString).deletingLastPathComponent + "/socket.lock"
+                if let s = try? String(contentsOfFile: lock, encoding: .utf8), let pid = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 1 {
+                    kill(pid, SIGTERM)
+                    usleep(500_000)
+                }
+                self.started = false
+            }
+            self.disconnect()
+            DispatchQueue.main.async { self.fullDiskAccess = nil }
+            self.warmUp()
+        }
     }
 
     private func isLatest(_ id: Int) -> Bool {

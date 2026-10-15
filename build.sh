@@ -27,6 +27,14 @@ codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "  (ad-hoc signing skip
 echo "  built $APP"
 
 # fsearch: the CLI and daemon FastLauncher talks to.
+# It runs as its own login agent, so Full Disk Access granted to it
+# survives rebuilds of FastLauncher (a daemon FastLauncher started would
+# borrow FastLauncher's grant, which each ad-hoc signature resets).
+AGENT="$HOME/Library/LaunchAgents/mt.nd.fsearch.plist"
+if [ -x "$HOME/.local/bin/fsearch" ] && [ ! -f "$AGENT" ]; then
+  echo "→ Running fsearch as a login agent"
+  "$HOME/.local/bin/fsearch" install --login >/dev/null
+fi
 if [ -x "$HOME/.local/bin/fsearch" ] || command -v fsearch >/dev/null; then
   echo "→ fsearch already installed"
 else
@@ -34,10 +42,10 @@ else
   TMP="$(mktemp -d)"
   if [ "$ARCH" = "arm64" ]; then
     curl -fsSL https://github.com/noahdunnagan/fsearch/releases/latest/download/fsearch-aarch64-apple-darwin.tar.gz | tar xz -C "$TMP"
-    "$TMP/fsearch" install
+    "$TMP/fsearch" install --login
   elif command -v cargo >/dev/null; then
     git clone --depth 1 https://github.com/noahdunnagan/fsearch "$TMP/fsearch"
-    (cd "$TMP/fsearch" && cargo build --release && ./target/release/fsearch install)
+    (cd "$TMP/fsearch" && cargo build --release && ./target/release/fsearch install --login)
   else
     echo "  No prebuilt fsearch for Intel Macs. Install Rust (https://rustup.rs) and run this again." >&2
   fi
