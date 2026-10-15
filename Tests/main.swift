@@ -69,6 +69,22 @@ check(conf("struct", ["/u/Instructions.pdf"]) == 0, "mid-word substring doesn't 
 check(conf("invoice ext:pdf", ["/u/invoice-2024.pdf"]) == 1, "filters ignored")
 check(conf("report", []) == 0, "no hits")
 check(conf("ext:pdf", ["/u/x.pdf"]) == 1, "only filters")
+
+// MARK: Percents
+
+func pct(_ q: String, _ p: String) -> Int? { Fuzzy.filePercent(q, path: p) }
+let gifts = "/u/iCloud Drive (Archive)/Wire Transfer Instructions - GIFTS.pdf"
+let mcp = "/u/strange-loop/mcps/user-context7/INSTRUCTIONS.md"
+print("  percents:", pct("wire instructions", gifts) ?? -1, pct("strange loop wire instructions", mcp) ?? -1,
+      pct("report", "/u/report.pdf") ?? -1, pct("wire transfer", gifts) ?? -1)
+check(pct("report", "/u/report.pdf") == 100, "exact name is 100%")
+check(pct("wire transfer", gifts)! >= 85, "words spelling the name's start score as one")
+check((70...90).contains(pct("wire instructions", gifts)!), "two words in the name: high")
+check(pct("strange loop wire instructions", mcp)! < 60 && pct("wire instructions", gifts)! > pct("strange loop wire instructions", mcp)! + 20, "words only in folders or by typo: low")
+check(pct("ext:pdf", "/u/a.pdf") == nil, "filters alone: no percent")
+check(Fuzzy.wordsPercent("wire bank", in: "Incoming wire transfers: bank details") == 100, "words in passage")
+check(Fuzzy.wordsPercent("wire zebra", in: "Incoming wire transfers") == 50, "half the words")
+check(Fuzzy.wordsPercent("ire", in: "wire") == 0, "mid-word doesn't count")
 check(!AppCatalog.isUserFacing("/Users/me/Library/Caches/x.app"), "Library skipped")
 
 // MARK: FSearchClient against a fake daemon

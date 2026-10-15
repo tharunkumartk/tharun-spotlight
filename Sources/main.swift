@@ -113,9 +113,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .replacingOccurrences(of: "+", with: "").replacingOccurrences(of: "space", with: "Space")
         add(menu, "Open FastLauncher   \(shortcut)", #selector(openLauncher))
         menu.addItem(.separator())
-        let status = NSMenuItem(title: fsearch.problem.map { "fsearch: \($0)" } ?? "fsearch: connected", action: nil, keyEquivalent: "")
+        let state = fsearch.problem ?? (fsearch.fullDiskAccess == false
+            ? "no Full Disk Access, so Desktop, Documents and Downloads aren't searched" : "connected")
+        let status = NSMenuItem(title: "fsearch: \(state)", action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
+        if fsearch.fullDiskAccess == false {
+            add(menu, "Give fsearch Full Disk Access…", #selector(grantAccess))
+            add(menu, "Restart fsearch", #selector(restartFSearch))
+        }
         let meaning = NSMenuItem(title: "DigUp (search by content): \(digup.status)", action: nil, keyEquivalent: "")
         meaning.isEnabled = false
         menu.addItem(meaning)
@@ -139,6 +145,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openLauncher() { launcher.show() }
 
     @objc private func rescan() { apps.refresh(force: true) }
+
+    /// Opens the Full Disk Access list with the fsearch binary shown in
+    /// Finder, ready to drag in (~/.local is hidden from the + button).
+    @objc private func grantAccess() {
+        if let bin = fsearch.binary { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: bin)]) }
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
+    }
+
+    @objc private func restartFSearch() { fsearch.restartDaemon() }
 
     @objc private func showSpotlightHelp() { spotlightHelp(firstRun: false) }
 

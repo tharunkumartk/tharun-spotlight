@@ -81,10 +81,7 @@ enum Fuzzy {
     /// strange-loop/…/INSTRUCTIONS.md; that scores 0.25 here. Filters such
     /// as ext:pdf and -word don't count.
     static func nameConfidence(_ query: String, paths: [String]) -> Double {
-        let words = query.split(separator: " ").map(String.init)
-            .filter { !$0.contains(":") && !$0.hasPrefix("-") }
-            .map { fold($0) }
-            .filter { $0.count >= 2 }
+        let words = queryWords(query).filter { $0.count >= 2 }
         guard !words.isEmpty else { return 1 }
         var best = 0
         for p in paths {
@@ -93,6 +90,47 @@ enum Fuzzy {
             if best == words.count { break }
         }
         return Double(best) / Double(words.count)
+    }
+
+    /// The words of a file search, folded, without fsearch's filters
+    /// (ext:pdf, in:…) and exclusions (-word).
+    static func queryWords(_ query: String) -> [[Character]] {
+        query.split(separator: " ").map(String.init)
+            .filter { !$0.contains(":") && !$0.hasPrefix("-") }
+            .map { fold($0) }
+    }
+
+    /// How well a file's name matches, 0…100: each word's `score` in the name
+    /// (1000 → 100%), averaged over the words. A word fsearch matched only in
+    /// a folder on the path counts 40% of its match there, and one it matched
+    /// only by a typo counts 30%. A query that names the file whole (several
+    /// words spelling its start) scores as one. Nil for filters alone.
+    static func filePercent(_ query: String, path: String) -> Int? {
+        let words = queryWords(query)
+        guard !words.isEmpty else { return nil }
+        let name = Name(((path as NSString).lastPathComponent as NSString).deletingPathExtension)
+        if words.count > 1, let s = score(Array(words.joined(separator: " ")), name), s >= 850 { return s / 10 }
+        let folders = (path as NSString).deletingLastPathComponent.split(separator: "/").map { Name(String($0)) }
+        var total = 0.0
+        for w in words {
+            if let s = score(w, name) {
+                total += Double(s) / 1000
+            } else if let s = folders.compactMap({ score(w, $0) }).max() {
+                total += 0.4 * Double(s) / 1000
+            } else {
+                total += 0.3
+            }
+        }
+        return Int((total / Double(words.count) * 100).rounded())
+    }
+
+    /// The share of the query's words that start a word in `text`, 0…100.
+    static func wordsPercent(_ query: String, in text: String) -> Int {
+        let words = queryWords(query)
+        guard !words.isEmpty else { return 0 }
+        let tokens = text.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map { fold(String($0)) }
+        let found = words.filter { w in tokens.contains { $0.starts(with: w) } }.count
+        return found * 100 / words.count
     }
 
     /// Each query letter continues the current word or starts a later one:

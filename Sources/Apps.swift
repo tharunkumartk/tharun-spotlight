@@ -74,19 +74,23 @@ final class AppCatalog {
         return out
     }
 
-    func search(_ query: String, limit: Int) -> [AppEntry] {
+    /// The best matches, each with how well its name matches (`Fuzzy.score`:
+    /// 1000 exact, 900 prefix, 800 a later word, 700 initials, 600 substring,
+    /// ≤300 scattered). They're ranked by that plus up to 120 for how often
+    /// you launch it and 500 if it's your pick for this exact query.
+    func search(_ query: String, limit: Int) -> [(app: AppEntry, match: Int)] {
         let q = Fuzzy.fold(query.trimmingCharacters(in: .whitespaces))
         guard !q.isEmpty else { return [] }
         let pick = picks[String(q)]
-        var scored: [(Int, AppEntry)] = []
+        var scored: [(Int, AppEntry, Int)] = []
         for app in apps {
-            guard var s = [Fuzzy.score(q, app.folded), app.alias.flatMap { Fuzzy.score(q, $0) }].compactMap({ $0 }).max() else { continue }
-            s += min(counts[app.path] ?? 0, 20) * 6
+            guard let match = [Fuzzy.score(q, app.folded), app.alias.flatMap { Fuzzy.score(q, $0) }].compactMap({ $0 }).max() else { continue }
+            var s = match + min(counts[app.path] ?? 0, 20) * 6
             if app.path == pick { s += 500 }
-            scored.append((s, app))
+            scored.append((s, app, match))
         }
         scored.sort { $0.0 != $1.0 ? $0.0 > $1.0 : $0.1.name.count < $1.1.name.count }
-        return scored.prefix(limit).map { $0.1 }
+        return scored.prefix(limit).map { (app: $0.1, match: $0.2) }
     }
 
     /// Remembers the pick: launched apps rank higher, and this exact query

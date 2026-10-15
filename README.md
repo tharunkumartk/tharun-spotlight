@@ -37,24 +37,32 @@ defaults write dev.fastlauncher.app Hotkey "opt+space"
 
 then quit and reopen FastLauncher.
 
-### Full Disk Access (optional)
+### Full Disk Access
 
-FastLauncher starts the fsearch daemon, which indexes your disk (seconds
-to a few minutes the first time). Without Full Disk Access it skips protected
-folders such as Mail and Messages. To index everything, add FastLauncher in
-**System Settings → Privacy & Security → Full Disk Access**. Each rebuild
-changes the ad-hoc signature, so you'll need to grant it again after one.
+fsearch runs as its own login agent (`build.sh` sets that up) and indexes
+your disk, seconds to a few minutes the first time. Without Full Disk Access
+it skips the folders macOS guards: **Desktop, Documents, Downloads**, iCloud
+Drive, Mail, Messages and other volumes. File search then shows a row saying
+so, and the menu bar offers **Give fsearch Full Disk Access…**.
+
+To grant it, add `~/.local/bin/fsearch` in **System Settings → Privacy &
+Security → Full Disk Access** (drag it in from the Finder window the menu
+item opens, or press ⇧⌘G in the + dialog and type the path). Then choose
+**Restart fsearch** from the menu bar: it only checks when it starts. The
+grant belongs to fsearch, so rebuilding FastLauncher doesn't undo it.
 
 ## Keys
 
 | Key | Action |
 |---|---|
 | ↑ ↓ (or ⌃P ⌃N) | move the selection |
+| ↑ on a fresh line | step back through past searches (↓ forward, → keeps one) |
 | ⏎ | open (for a math result: copy it) |
 | ⌘1 … ⌘9 | open that row |
-| ⌘⏎ or ⌘-click | reveal in Finder |
+| ⌘⏎ or ⌘-click | reveal in Finder (hold ⌘ and the rows say so) |
 | ⌥⏎ or ⌥-click | copy the path |
 | ⇥ | complete the selected name into the search line |
+| drag a row | drag the file or app itself, as from Finder |
 | space (first character) | switch to file search |
 | \` (first character) | switch to content search |
 | ⌫ on an empty line | back to apps |
@@ -94,12 +102,18 @@ matches come first; otherwise the content matches do, since fsearch then
 only matched folder names or a typo. Queries with a filter (`ext:pdf`,
 `in:…`) search names only.
 
-To see each file's match score (fsearch's name score, or DigUp's cosine
-similarity):
+## Scores
 
-```bash
-defaults write dev.fastlauncher.app ShowScores -bool true
-```
+Each result shows how well it matched, as a percent at the right of the row:
+
+| Result | Percent |
+|---|---|
+| app | how the name matches: 100% exact, about 90% a prefix, 75–80% a later word, 70% initials, 55–60% a substring, 30% or less scattered letters. Apps you launch often, and the one you picked last time for this query, rank higher without changing their percent |
+| file by name | the same name matching for each word you typed, averaged. A word found only in a folder on the path counts 40% of its match there, and one fsearch matched only by a typo counts 30% |
+| file by content (≈) | how far the passage stands out from everything DigUp indexed: 0% at 3 standard deviations, 100% at 6 (raw cosine similarity bunches up too much to tell matches from noise). A match on exact words alone shows the share of your words in the passage. In file search, content matches under 20% are left out |
+
+The percents are a guide, not probabilities: the three are measured
+differently, and a content match's percent depends on what else is indexed.
 
 ## Apps
 

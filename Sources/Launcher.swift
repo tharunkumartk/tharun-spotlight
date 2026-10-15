@@ -15,6 +15,17 @@ struct ResultItem {
     var action: Action
     var iconPath: String? = nil
     var symbol: String? = nil
+    /// How well it matched, shown at the right of the row. Each source has its
+    /// own scale (see README), so compare scores within a source only.
+    var score: String? = nil
+
+    /// A file or app: ⌘-click reveals it, and it can be dragged out.
+    var isFile: Bool {
+        switch action {
+        case .openApp, .openFile: return true
+        default: return false
+        }
+    }
 }
 
 /// Borderless, and non-activating: it takes the keyboard without pulling the
@@ -41,7 +52,7 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
     private let chipLabel = NSTextField(labelWithString: "")
     /// What the search line searches. A leading space (or ') enters `.files`,
     /// a leading ` enters `.contents`; backspace on an empty line goes back to apps.
-    private enum Mode {
+    private enum Mode: String {
         case apps
         /// By name with fsearch, plus DigUp's content matches once typing pauses.
         case files
@@ -69,6 +80,13 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
     private var meaningHits: [MeaningHit] = []
     private var meaningWork: DispatchWorkItem?
     private var monitor: Any?
+    /// ⌘ is down: file and app rows say ⌘-click shows them in Finder.
+    private var commandHeld = false
+    /// What was searched before, oldest first: the mode and the line when a
+    /// result was opened. ↑ on a fresh line steps back through it.
+    private var history: [(mode: Mode, text: String)] = LauncherController.loadHistory()
+    /// Where ↑ ↓ are in `history`, while the line is a recalled search.
+    private var historyIndex: Int?
     /// The panel's top edge on screen: it grows downward as results come in.
     private var top: CGFloat = 0
     private let font = NSFont.systemFont(ofSize: 30, weight: .light)
@@ -156,6 +174,17 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         table.dataSource = self
         table.delegate = self
         table.onClick = { [weak self] row, mods in self?.run(row, modifiers: mods) }
+        table.fileForRow = { [weak self] row in
+            guard let self, self.items.indices.contains(row) else { return nil }
+            switch self.items[row].action {
+            case .openApp(let p), .openFile(let p): return p
+            default: return nil
+            }
+        }
+        table.onDrop = { [weak self] path in
+            self?.hide()
+            self?.fsearch.reportOpen(path)
+        }
         scroll.documentView = table
         scroll.drawsBackground = false
         scroll.contentView.drawsBackground = false
@@ -173,8 +202,13 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         border.autoresizingMask = [.width, .height]
         effect.addSubview(border)
 
-        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] e in
             guard let self else { return e }
+            if e.type == .flagsChanged {
+                self.setCommandHeld(e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                    .subtracting([.capsLock, .numericPad, .function]) == .command)
+                return e
+            }
             return self.handleKey(e) // nil swallows the key
         }
         layoutViews()
@@ -194,6 +228,8 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         top = vf.maxY - vf.height * 0.2
         panel.setFrameOrigin(NSPoint(x: vf.midX - width / 2, y: top - panel.frame.height))
         field.stringValue = ""
+        historyIndex = nil
+        commandHeld = false
         setMode(.apps)
         update(items: [])
         panel.effectiveAppearance.performAsCurrentDrawingAppearance {
@@ -256,7 +292,10 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
 
     /// Shows or hides the mode's pill, and the placeholder and icon that go with it.
     private func setMode(_ new: Mode) {
-        if new != .apps, mode == .apps { digup.warmUp() }
+        if new != .apps, mode == .apps {
+            digup.warmUp()
+            fsearch.warmUp()
+        }
         mode = new
         let on = new != .apps
         panel.effectiveAppearance.performAsCurrentDrawingAppearance {
@@ -296,6 +335,7 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
     /// A leading space (or ', as in Alfred) switches to file search, and a
     /// leading ` to content search; the character becomes the mode's pill.
     func controlTextDidChange(_ obj: Notification) {
+        historyIndex = nil
         let raw = field.stringValue
         if mode == .apps, let first = raw.first, let new: Mode = first == "`" ? .contents : first == " " || first == "'" ? .files : nil {
             field.stringValue = String(raw.dropFirst())
@@ -320,7 +360,7 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
                 return update(items: [ResultItem(
                     title: "Search files",
                     subtitle: "Type a name. Filters work too: ext:pdf  in:~/Documents  type:image  mtime:<7d  grep:TODO",
-                    action: .none, symbol: "doc.text.magnifyingglass")])
+                    action: .none, symbol: "doc.text.magnifyingglass")] + accessHint)
             }
             fileHits = nil
             meaningHits = []
@@ -357,8 +397,9 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
                 action: .copy(Calc.format(v, grouping: false)),
                 iconPath: "/System/Applications/Calculator.app"))
         }
-        let local = apps.search(q, limit: maxRows)
-        let localItems = local.map { appItem($0) }
+        let scored = apps.search(q, limit: maxRows)
+        let local = scored.map(\.app)
+        let localItems = scored.map { appItem($0.app, percent: min($0.match / 10, 100)) }
         update(items: withFallbacks(head + localItems, q))
 
         // The index knows apps outside the usual folders (Downloads, a
@@ -370,14 +411,14 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
             let knownNames = Set(local.map { $0.name.lowercased() })
             var seen = Set<String>()
             let extra = hits
-                .map(\.path)
-                .filter { AppCatalog.isUserFacing($0) && !knownPaths.contains($0) }
-                .filter { p in
-                    let name = Self.appName(p).lowercased()
+                .filter { AppCatalog.isUserFacing($0.path) && !knownPaths.contains($0.path) }
+                .filter { h in
+                    let name = Self.appName(h.path).lowercased()
                     return !knownNames.contains(name) && seen.insert(name).inserted
                 }
                 .prefix(self.maxRows - local.count)
-                .map { ResultItem(title: Self.appName($0), subtitle: Self.tilde($0), action: .openApp($0), iconPath: $0) }
+                .map { ResultItem(title: Self.appName($0.path), subtitle: Self.tilde($0.path), action: .openApp($0.path),
+                                  iconPath: $0.path, score: Fuzzy.filePercent(q, path: $0.path).map(Self.percent)) }
             guard !extra.isEmpty else { return }
             self.update(items: self.withFallbacks(localItems + extra, q), keepSelection: true)
         }
@@ -408,7 +449,7 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
                         subtitle: "DigUp: \(self.digup.status). Add folders in DigUp, or ⌫ and space to search names",
                         action: .none, symbol: "doc.questionmark")])
                 }
-                self.update(items: hits.map { self.meaningItem($0) })
+                self.update(items: hits.map { self.meaningItem($0, query: q) })
             }
         }
         meaningWork = work
@@ -435,8 +476,10 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
             names = []
         }
         let confidence = Fuzzy.nameConfidence(q, paths: names.prefix(5).map(\.path))
-        let nameItems = names.map { fileItem($0) }
-        let meaningItems = meaningHits.map { meaningItem($0) }
+        let nameItems = names.map { fileItem($0, query: q) }
+        // A meaning match that barely stands out is noise next to name
+        // matches (gibberish still gets "strong" hits); content mode shows them all.
+        let meaningItems = meaningHits.filter { Self.meaningPercent($0, q) >= 20 }.map { meaningItem($0, query: q) }
         let ordered = confidence >= 1 ? nameItems + meaningItems : meaningItems + nameItems
         var seen = Set<String>()
         let merged = ordered.filter { item in
@@ -446,18 +489,29 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         guard !merged.isEmpty else {
             return update(items: [ResultItem(
                 title: "No files match “\(q)”", subtitle: "Try fewer letters, or a filter like ext:pdf",
-                action: .none, symbol: "doc.questionmark")])
+                action: .none, symbol: "doc.questionmark")] + accessHint)
         }
         // The second answer for a query reorders the first: stay on the file
         // that was selected, wherever it moved.
         var current: String?
         if items.indices.contains(selected), case .openFile(let p) = items[selected].action { current = p }
-        let list = Array(merged.prefix(50))
+        let list = Array(merged.prefix(50)) + accessHint
         update(items: list)
         if fileHits != nil, !meaningHits.isEmpty, let current,
            let i = list.firstIndex(where: { if case .openFile(let p) = $0.action { return p == current }; return false }) {
             select(i)
         }
+    }
+
+    /// A last row while fsearch can't read Desktop, Documents and Downloads,
+    /// so a file missing from there isn't a mystery.
+    private var accessHint: [ResultItem] {
+        guard fsearch.fullDiskAccess == false else { return [] }
+        return [ResultItem(
+            title: "Desktop, Documents and Downloads aren't searched",
+            subtitle: "fsearch needs Full Disk Access: add ~/.local/bin/fsearch, then Restart fsearch in the menu bar",
+            action: .openURL(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!),
+            symbol: "lock")]
     }
 
     private func withFallbacks(_ items: [ResultItem], _ q: String) -> [ResultItem] {
@@ -476,37 +530,38 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         return out
     }
 
-    private func appItem(_ app: AppEntry) -> ResultItem {
-        ResultItem(title: app.name, subtitle: Self.tilde(app.path), action: .openApp(app.path), iconPath: app.path)
+    private func appItem(_ app: AppEntry, percent: Int) -> ResultItem {
+        ResultItem(title: app.name, subtitle: Self.tilde(app.path), action: .openApp(app.path), iconPath: app.path,
+                   score: Self.percent(percent))
     }
 
-    private func fileItem(_ hit: FSHit) -> ResultItem {
+    static func percent(_ p: Int) -> String { "\(p)%" }
+
+    private func fileItem(_ hit: FSHit, query: String) -> ResultItem {
         let dir = Self.tilde((hit.path as NSString).deletingLastPathComponent)
-        var subtitle = hit.detail.map { "\(dir)  —  \($0)" } ?? dir
-        if showScores { subtitle = "name \(hit.score)  ·  " + subtitle }
         return ResultItem(
             title: (hit.path as NSString).lastPathComponent,
-            subtitle: subtitle,
-            action: .openFile(hit.path), iconPath: hit.path)
+            subtitle: hit.detail.map { "\(dir)  —  \($0)" } ?? dir,
+            action: .openFile(hit.path), iconPath: hit.path, score: Fuzzy.filePercent(query, path: hit.path).map(Self.percent))
     }
 
     /// A file DigUp found by what's in it: the passage that matched, marked ≈.
-    private func meaningItem(_ hit: MeaningHit) -> ResultItem {
+    private func meaningItem(_ hit: MeaningHit, query: String) -> ResultItem {
         var parts: [String] = []
-        if showScores {
-            parts.append(hit.cosine.map { String(format: "meaning %.2f", $0) } ?? "words #\(hit.keywordRank ?? 0)")
-        }
         if hit.kind == "pdf", let page = hit.loc { parts.append("p. \(Int(page))") }
         parts.append(hit.excerpt.map { "“\($0)”" } ?? Self.tilde((hit.path as NSString).deletingLastPathComponent))
         return ResultItem(
             title: (hit.path as NSString).lastPathComponent,
             subtitle: "≈ " + parts.joined(separator: "  ·  "),
-            action: .openFile(hit.path), iconPath: hit.path)
+            action: .openFile(hit.path), iconPath: hit.path,
+            score: Self.percent(Self.meaningPercent(hit, query)))
     }
 
-    /// `defaults write dev.fastlauncher.app ShowScores -bool true` shows each
-    /// file's match score: fsearch's name score, or DigUp's cosine similarity.
-    private var showScores: Bool { UserDefaults.standard.bool(forKey: "ShowScores") }
+    /// From how far it stands out by meaning, or, matched on exact words
+    /// alone, the share of the query's words in the passage.
+    static func meaningPercent(_ hit: MeaningHit, _ query: String) -> Int {
+        hit.z.map(DigUpClient.percent(z:)) ?? Fuzzy.wordsPercent(query, in: hit.excerpt ?? hit.path)
+    }
 
     static func appName(_ path: String) -> String {
         let name = FileManager.default.displayName(atPath: path)
@@ -521,8 +576,18 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
         switch sel {
+        // The arrows step through past searches from a fresh line, and keep
+        // doing so while the line is one; ⌃P ⌃N always move the selection.
+        case #selector(NSResponder.moveUp(_:)) where isArrowKey && (historyIndex != nil || isFreshLine):
+            if !history.isEmpty { recall(max((historyIndex ?? history.count) - 1, 0)) }
+        case #selector(NSResponder.moveDown(_:)) where isArrowKey && historyIndex != nil:
+            recall(historyIndex! + 1)
         case #selector(NSResponder.moveUp(_:)): select(selected - 1)
         case #selector(NSResponder.moveDown(_:)): select(selected + 1)
+        case #selector(NSResponder.moveRight(_:)) where historyIndex != nil:
+            // → keeps the recalled search: the arrows go back to the results.
+            historyIndex = nil
+            return false
         case #selector(NSResponder.insertNewline(_:)): run(selected, modifiers: NSApp.currentEvent?.modifierFlags ?? [])
         case #selector(NSResponder.cancelOperation(_:)): hide()
         case #selector(NSResponder.insertTab(_:)): autocomplete()
@@ -533,6 +598,53 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         default: return false
         }
         return true
+    }
+
+    private var isArrowKey: Bool {
+        let code = NSApp.currentEvent?.keyCode
+        return code == 126 || code == 125
+    }
+
+    private var isFreshLine: Bool { mode == .apps && field.stringValue.isEmpty }
+
+    /// Puts a past search on the line; one past the newest clears it.
+    private func recall(_ i: Int) {
+        guard i < history.count else {
+            historyIndex = nil
+            field.stringValue = ""
+            setMode(.apps)
+            return search()
+        }
+        historyIndex = i
+        setMode(history[i].mode)
+        field.stringValue = history[i].text
+        moveCursorToEnd()
+        search()
+    }
+
+    private func remember(_ mode: Mode, _ text: String) {
+        let text = text.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return }
+        history.removeAll { $0.mode == mode && $0.text == text }
+        history.append((mode, text))
+        if history.count > 100 { history.removeFirst(history.count - 100) }
+        UserDefaults.standard.set(history.map { [$0.mode.rawValue, $0.text] }, forKey: "History")
+    }
+
+    private static func loadHistory() -> [(mode: Mode, text: String)] {
+        (UserDefaults.standard.array(forKey: "History") as? [[String]] ?? []).compactMap { e in
+            guard e.count == 2, let m = Mode(rawValue: e[0]) else { return nil }
+            return (m, e[1])
+        }
+    }
+
+    private func setCommandHeld(_ on: Bool) {
+        guard on != commandHeld else { return }
+        commandHeld = on
+        let rows = table.rows(in: table.visibleRect)
+        for r in rows.location..<(rows.location + rows.length) {
+            (table.view(atColumn: 0, row: r, makeIfNecessary: false) as? ResultCell)?.setRevealing(on)
+        }
     }
 
     /// ⌘1–⌘9 open a row; ⌘⏎ reveals in Finder; ⌥⏎ copies the path. The
@@ -583,6 +695,7 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         case .openFile(let p): field.stringValue = (p as NSString).lastPathComponent
         default: return
         }
+        historyIndex = nil
         moveCursorToEnd()
         search()
     }
@@ -595,6 +708,8 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         guard items.indices.contains(i) else { return }
         let item = items[i]
         let query = field.stringValue
+        if case .none = item.action { return }
+        if case .searchFiles = item.action {} else { remember(mode, query) }
         switch item.action {
         case .none:
             return
@@ -640,7 +755,7 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard items.indices.contains(row) else { return nil }
         let cell = tableView.makeView(withIdentifier: ResultCell.id, owner: nil) as? ResultCell ?? ResultCell(frame: .zero)
-        cell.configure(items[row], index: row, selected: row == selected)
+        cell.configure(items[row], index: row, selected: row == selected, revealing: commandHeld)
         return cell
     }
 
@@ -665,13 +780,71 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
 
 /// Takes clicks itself: a click opens the row, ⌘-click shows it in Finder,
 /// ⌥-click copies its path. (NSTableView would read ⌘-click as "toggle
-/// selection".)
+/// selection".) Dragging a file or app row drags the file itself, as from
+/// Finder: into a folder, an email, the Dock.
 final class ResultTable: NSTableView {
     var onClick: ((Int, NSEvent.ModifierFlags) -> Void)?
+    /// The file or app a row stands for, if it can be dragged out.
+    var fileForRow: ((Int) -> String?)?
+    /// A dragged file was dropped somewhere.
+    var onDrop: ((String) -> Void)?
+    private var dragging: String?
 
     override func mouseDown(with event: NSEvent) {
         let r = row(at: convert(event.locationInWindow, from: nil))
-        if r >= 0 { onClick?(r, event.modifierFlags.intersection(.deviceIndependentFlagsMask)) }
+        guard r >= 0, let window else { return }
+        let start = event.locationInWindow
+        let path = fileForRow?(r)
+        // A click opens on release; moving a few points first starts a drag.
+        while let next = window.nextEvent(matching: [.leftMouseUp, .leftMouseDragged]) {
+            if next.type == .leftMouseUp {
+                return onClick?(r, event.modifierFlags.intersection(.deviceIndependentFlagsMask)) ?? ()
+            }
+            let p = next.locationInWindow
+            if let path, hypot(p.x - start.x, p.y - start.y) >= 4 {
+                return drag(path, from: event)
+            }
+        }
+    }
+
+    private func drag(_ path: String, from event: NSEvent) {
+        let item = NSDraggingItem(pasteboardWriter: URL(fileURLWithPath: path) as NSURL)
+        let image = Self.dragImage(path)
+        let at = convert(event.locationInWindow, from: nil)
+        item.setDraggingFrame(NSRect(x: at.x - 16, y: at.y - image.size.height / 2,
+                                     width: image.size.width, height: image.size.height), contents: image)
+        dragging = path
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+
+    /// The file's icon and name, as Finder shows a dragged file.
+    static func dragImage(_ path: String) -> NSImage {
+        let icon = NSWorkspace.shared.icon(forFile: path)
+        let name = NSAttributedString(string: FileManager.default.displayName(atPath: path), attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium), .foregroundColor: NSColor.white,
+        ])
+        let side: CGFloat = 32
+        let label = NSSize(width: min(ceil(name.size().width) + 12, 320), height: ceil(name.size().height) + 4)
+        let size = NSSize(width: side + 4 + label.width, height: side)
+        return NSImage(size: size, flipped: false) { _ in
+            icon.draw(in: NSRect(x: 0, y: 0, width: side, height: side))
+            let box = NSRect(x: side + 4, y: (side - label.height) / 2, width: label.width, height: label.height)
+            NSColor.black.withAlphaComponent(0.55).setFill()
+            NSBezierPath(roundedRect: box, xRadius: label.height / 2, yRadius: label.height / 2).fill()
+            name.draw(with: box.insetBy(dx: 6, dy: 2), options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+            return true
+        }
+    }
+
+    override func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        // As from Finder: the place it lands decides (a folder on the same
+        // disk moves it, another disk or an app copies, ⌥ copies, ⌘⌥ aliases).
+        context == .outsideApplication ? [.copy, .move, .link, .generic] : []
+    }
+
+    override func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        defer { dragging = nil }
+        if operation != [], let path = dragging { onDrop?(path) }
     }
 }
 
@@ -699,6 +872,11 @@ final class ResultCell: NSView {
     private let title = NSTextField(labelWithString: "")
     private let subtitle = NSTextField(labelWithString: "")
     private let shortcut = NSTextField(labelWithString: "")
+    private let score = NSTextField(labelWithString: "")
+    private var item: ResultItem?
+    private var selected = false
+    /// ⌘ is down and this is a file: say that a click shows it in Finder.
+    private var revealing = false
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -710,11 +888,13 @@ final class ResultCell: NSView {
         subtitle.lineBreakMode = .byTruncatingMiddle
         shortcut.font = .systemFont(ofSize: 13)
         shortcut.alignment = .right
-        for l in [title, subtitle, shortcut] {
+        score.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        score.alignment = .right
+        for l in [title, subtitle, shortcut, score] {
             l.cell?.usesSingleLineMode = true
             l.maximumNumberOfLines = 1
         }
-        for v in [icon, title, subtitle, shortcut] { addSubview(v) }
+        for v in [icon, title, subtitle, shortcut, score] { addSubview(v) }
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -725,8 +905,10 @@ final class ResultCell: NSView {
         let w = bounds.width
         icon.frame = NSRect(x: 10, y: (h - 36) / 2, width: 36, height: 36)
         shortcut.frame = NSRect(x: w - 52, y: (h - 18) / 2, width: 40, height: 18)
+        let scoreWidth: CGFloat = score.stringValue.isEmpty ? 0 : 44
+        score.frame = NSRect(x: w - 52 - scoreWidth - 4, y: (h - 16) / 2, width: scoreWidth, height: 16)
         let x: CGFloat = 58
-        let tw = w - x - (shortcut.stringValue.isEmpty ? 12 : 60)
+        let tw = w - x - (shortcut.stringValue.isEmpty ? 12 : 60) - (scoreWidth > 0 ? scoreWidth + 4 : 0)
         if subtitle.isHidden {
             title.frame = NSRect(x: x, y: (h - 22) / 2, width: tw, height: 22)
         } else {
@@ -735,20 +917,37 @@ final class ResultCell: NSView {
         }
     }
 
-    func configure(_ item: ResultItem, index: Int, selected: Bool) {
+    func configure(_ item: ResultItem, index: Int, selected: Bool, revealing: Bool) {
+        self.item = item
+        self.selected = selected
         title.stringValue = item.title
-        subtitle.stringValue = item.subtitle
-        subtitle.isHidden = item.subtitle.isEmpty
         shortcut.stringValue = index < 9 ? "⌘\(index + 1)" : ""
+        score.stringValue = item.score ?? ""
         icon.image = Icons.image(path: item.iconPath, symbol: item.symbol)
-        setSelected(selected)
-        needsLayout = true
+        setRevealing(revealing)
     }
 
     func setSelected(_ on: Bool) {
+        selected = on
+        applyColors()
+    }
+
+    func setRevealing(_ on: Bool) {
+        guard let item else { return }
+        revealing = on && item.isFile
+        subtitle.stringValue = revealing ? "Click to show in Finder  ·  \(item.subtitle)" : item.subtitle
+        subtitle.isHidden = subtitle.stringValue.isEmpty
+        applyColors()
+        needsLayout = true
+    }
+
+    private func applyColors() {
+        let on = selected
         title.textColor = on ? .white : .labelColor
-        subtitle.textColor = on ? NSColor.white.withAlphaComponent(0.8) : .secondaryLabelColor
+        subtitle.textColor = revealing ? (on ? .white : .controlAccentColor)
+            : on ? NSColor.white.withAlphaComponent(0.8) : .secondaryLabelColor
         shortcut.textColor = on ? NSColor.white.withAlphaComponent(0.8) : .tertiaryLabelColor
+        score.textColor = on ? NSColor.white.withAlphaComponent(0.7) : .tertiaryLabelColor
         icon.contentTintColor = on ? .white : .secondaryLabelColor
     }
 }
